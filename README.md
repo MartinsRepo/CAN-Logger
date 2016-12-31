@@ -18,5 +18,10 @@ The VectorDBC file is a text file. So you can copy the messages to be logged int
 
 The example file can be found under config.txt.
 
+The libraries:
 
+- MCP_CAN_lib-master.zip
+- SdFat.zip
+
+are the original one except chip select modifications
 

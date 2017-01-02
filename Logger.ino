@@ -10,7 +10,9 @@
 #define SD_CHIPSEL 4
 const uint8_t SD_CHIP_SELECT = SD_CHIPSEL;
 const int8_t DISABLE_CHIP_SELECT = -1;
-SdFat sd;  
+SdFat sd;
+File logging;  
+String kline=""; 
 
 long unsigned int rxId;
 unsigned char len = 0;
@@ -23,13 +25,15 @@ unsigned char rxBuf[8];
 MCP_CAN CAN0(CAN_CHIPSEL);                    // Set CS to pin 10
 
 // control flags
-bool can_active;
-bool sd_active;
+bool can_active=false;
+bool sd_active=false;
+bool header=false;
 
 // config.txt 
 File file;
 int lsize=0;
 int qsize=0;
+int msgtot=0;
 
 class MESSAGE {
   public:
@@ -219,12 +223,13 @@ void setup()
   String msg, id, start, signame, siglen, format, factor, offset/*, smin, smax, unit*/; 
   int tokenstart;
   char *buf;
-
+  
   ArrayList *list = new ArrayList("CAN Signal List");
   
 #ifdef DEBUG_LOGGER  
   // Open serial communications and wait for port to open:
    Serial.begin(115200);
+  
    while (!Serial) {
      ; // wait for serial port to connect. Needed for native USB port only
   }
@@ -396,7 +401,7 @@ void setup()
       list->display_string_list();
 #endif
     lsize=list->get_size();
-    //if(lsize>20) lsize=20;                                        // limitate to 20 signals
+    //if(lsize>40) lsize=40;                                        // limitate to 40 signals
    
     // extract CAN information from list array
     for(int i=1;i<lsize;i++) {
@@ -446,8 +451,7 @@ void setup()
       cnt=delimiterpos(line, ',', 8);
       offset=strtmp.substring(tokenstart,cnt);
       canmsg[i]->offset=offset.toFloat(); 
-    }
-      
+    } 
   } // if(can_active && sd_active)
   delete list;
   lsize--;
@@ -456,6 +460,7 @@ void setup()
   int tmpid=-1, ipos=0, tmpnb=0, tmpst=-1;
   int idold=canmsg[1]->id;
   bool fentry=false;
+  
   for(int i=1;i<lsize+1;i++) {
     
       msgtab[ipos]=new WHICHMSG();
@@ -478,12 +483,27 @@ void setup()
          msgtab[ipos]->counts=tmpnb;
          tmpnb=0;
          i--;
-          /* Serial.print(msgtab[ipos]->id);  Serial.print(" ");Serial.print(msgtab[ipos]->start);  Serial.print(" ");Serial.print(msgtab[ipos]->counts);  Serial.print(" ");
-          Serial.println(); */
+         
          ipos++;
       } 
   }
   qsize=ipos--;
+  
+   // open file for log writing
+    if(!header) {
+        logging = sd.open("test.txt", FILE_WRITE);
+        // write signal names
+   
+        for(int i=1;i<lsize+1;i++) {
+            logging.print(canmsg[i]->signame);
+            logging.print(",");  
+        }
+        logging.println(); 
+        logging.flush(); 
+        header=true;
+    }
+
+    msgtot=0;
 }
 
 void loop() 
@@ -494,29 +514,23 @@ void loop()
   bool sigbyteplus=false;
   char masking[32];
   
+  
   if (can_active && sd_active) {
     
     if(!digitalRead(CAN0_INT)) {                        // If CAN0_INT pin is low, read receive buffer
     
       CAN0.readMsgBuf(&rxId, &len, rxBuf);      // Read data: len = data length, buf = data byte(s)
 
-      /*
-       * Hier eintreffende ID auf Tabelle abprüfen und dementsprechend in der for-schleife i=start; i<anzahl setzen
-       */
-      /*while(1) {
-        
-      }*/
       // check relevant message id
       int qcount=0, starting=0, ending=0;
+      //line="";
       while(qcount<qsize) {
           starting  = msgtab[qcount]->start;
           ending = msgtab[qcount]->counts;
           qcount++;
              
           for(int i=starting; i<starting+ending;i++) {
-            /*Serial.println(rxId); 
-            Serial.println(canmsg[i]->id); */
-           // Serial.println(canmsg[i]->msgname); 
+         
              if(rxId==canmsg[i]->id) {
                // find start position
                startpos=canmsg[i]->start;
@@ -531,18 +545,6 @@ void loop()
                if(bnumber<0) bnumber=0;
                bpos=startpos%8;
     
-              
-               
-              /* for(int i=0;i<8;i++) {Serial.print(rxBuf[i]);Serial.print(" ");}
-               Serial.println();
-               Serial.println(bnumber);  
-               Serial.print("******");
-               Serial.println(canmsg[i]->factor);
-               Serial.println(canmsg[i]->offset);
-              
-               Serial.println(startpos);
-               Serial.println(tmpval);
-               Serial.println("+++++++++");*/
                if((bpos+canmsg[i]->siglen)>8){       // check. whether signal + offset more then one byte
                   sigbyteplus=true;
                } else {
@@ -550,22 +552,15 @@ void loop()
                }
     
                if(!sigbyteplus) {                    // signal matches one byte - filter asignal
-                   // take first byte
+                   
                   int tmpval=rxBuf[bnumber];
                   int tmpvalval=0;
-                  
-                  Serial.println(canmsg[i]->signame); 
-    
+                 
                   // calculate masking vector
                   for(int i=0;i<8;i++) masking[i]='0';
                   for(int i=0;i<8;i++){
                     if((i>=bpos)&&(i<bpos+siglen)) masking[7-i]='1'; else masking[7-i]='0';
                   }
-                
-              /*   for(int i=0;i<8;i++) {Serial.print(masking[i]);Serial.print(" ");}
-                 Serial.println();
-                 Serial.println(bpos);
-                 Serial.println(tmpval);*/
     
                   // extract value
                   for(int i=0;i<8;i++) {
@@ -576,11 +571,9 @@ void loop()
                     }
                  }
                
-                 //Serial.println(tmpvalval);
-    
-                  physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
-                  Serial.println(physval); 
-                 
+                 physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
+                 kline=kline+String(physval)+",";
+                
                } else {  // concatenated signals over more bytes
                   
                   for(int i=0;i<32;i++) masking[i]='0';
@@ -602,9 +595,9 @@ void loop()
                   }
                   unsigned long tmplong=0UL;  //==> supports only 4 byte!!!
                   unsigned long tmpvalval=0UL;
+                  
                   if(nbbytes<4) {
-                      Serial.println(canmsg[i]->signame); 
-                    
+                     
                       for(int i=nbbytes;i>=0;i--) {
                           tmplong=tmplong +(unsigned long)(rxBuf[bnumber+i]<<(8*i));
                       }
@@ -617,38 +610,30 @@ void loop()
                           } 
                         }
                       }
-                /*   Serial.println("***");
-                     for(int i=0;i<total;i++) {Serial.print(masking[i]);Serial.print(" ");}
-                     Serial.println("***");*/
-                     Serial.println(tmplong); 
-                     Serial.println(tmpvalval);
-                     
+              
                      physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
-                     Serial.println(physval);
+                     kline=kline+String(physval)+",";
+                   
                } //if(nbbytes<4)
-               
-               
-             
-    /*
-               int tmplen=0;
-               if(tmpval>127) tmplen=8; else
-               if(tmpval>63) tmplen=7; else
-               if(tmpval>31) tmplen=6; else
-               if(tmpval>15) tmplen=5; else
-               if(tmpval>7) tmplen=4; else
-               if(tmpval>3) tmplen=3; else
-               if(tmpval>1) tmplen=2; else
-               tmplen=1;*/
-               
-               // now extract signal values from the message string
-    
-             
+                
           }// else
-  
+        
         } // if(rxId==canmsg[i]->id)
+         
        }// for(int i=starting; i<starting+ending;i++)
-
+     
+       if(qcount==qsize) {
+          msgtot++; 
+          if(msgtot==qsize) {
+              Serial.println(kline);
+              logging.println(kline); 
+              logging.flush();
+              msgtot=0;
+              kline="";
+          }
+       }
       } // while
+     
      } //if(!digitalRead(CAN0_INT))
   } //  if (can_active && sd_active)
 }// loop

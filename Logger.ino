@@ -11,8 +11,8 @@
 const uint8_t SD_CHIP_SELECT = SD_CHIPSEL;
 const int8_t DISABLE_CHIP_SELECT = -1;
 SdFat sd;
-File logging;  
-String kline=""; 
+File logging[10];  
+String kline;
 
 long unsigned int rxId;
 unsigned char len = 0;
@@ -23,11 +23,12 @@ unsigned char rxBuf[8];
 #define CAN0_INT 2                            // Set INT to pin 2
 #define CAN_CHIPSEL 10
 MCP_CAN CAN0(CAN_CHIPSEL);                    // Set CS to pin 10
+unsigned long previousMillis=0;
 
 // control flags
 bool can_active=false;
 bool sd_active=false;
-bool header=false;
+bool header[10]={false,false,false,false,false,false,false,false,false,false};
 
 // config.txt 
 File file;
@@ -459,7 +460,6 @@ void setup()
   // message table: id, first event and how often
   int tmpid=-1, ipos=0, tmpnb=0, tmpst=-1;
   int idold=canmsg[1]->id;
-  bool fentry=false;
   
   for(int i=1;i<lsize+1;i++) {
     
@@ -474,49 +474,67 @@ void setup()
          tmpnb++;
          if(i++>lsize) break;
       }
-      
+     
       if(tmpid!=canmsg[i]->id) {
          idold=canmsg[i]->id;
-         fentry=false;
+         //fentry=false;
          msgtab[ipos]->id=tmpid;
          msgtab[ipos]->start=tmpst;
          msgtab[ipos]->counts=tmpnb;
+        
          tmpnb=0;
          i--;
          
          ipos++;
       } 
-  }
-  qsize=ipos--;
+   }
+   qsize=ipos--;
   
    // open file for log writing
-    if(!header) {
-        logging = sd.open("test.txt", FILE_WRITE);
-        // write signal names
-   
-        for(int i=1;i<lsize+1;i++) {
-            logging.print(canmsg[i]->signame);
-            logging.print(",");  
+   String fname;
+   int sigpos=0,counts=0;
+   for(int i=0;i<qsize;i++){
+      sigpos=msgtab[i]->start;
+      counts=msgtab[i]->counts;
+      
+      if(header[i]==false) {
+          logging[i].seek(0);
+          fname=String(msgtab[i]->id)+".txt";
+          logging[i] = sd.open(fname, FILE_WRITE);
+          
+          // write signal names
+          for(int j=sigpos;j<(sigpos+counts);j++) {
+              if(j==sigpos) {
+                String ss="Delta Time,"+canmsg[j]->signame+",";
+                logging[i].print(ss);
+              } else {
+                logging[i].print(canmsg[j]->signame);
+                logging[i].print(",");  
+              }
+          }
+          logging[i].println(); 
+         // logging[i].flush(); 
+          header[i]=true;
         }
-        logging.println(); 
-        logging.flush(); 
-        header=true;
-    }
+   }
 
-    msgtot=0;
+   msgtot=0;
+   kline="";
+   previousMillis=millis(); 
 }
 
 void loop() 
 { 
   int startpos, siglen;
-  int bnumber=0; int bpos=0;
+  int bnumber=0; int bpos=0, mpos=0;
   double physval=0;
   bool sigbyteplus=false;
   char masking[32];
-  
-  
+  unsigned long currentMillis;
+  int interval[10]={0,0,0,0,0,0,0,0,0,0};
+
   if (can_active && sd_active) {
-    
+      
     if(!digitalRead(CAN0_INT)) {                        // If CAN0_INT pin is low, read receive buffer
     
       CAN0.readMsgBuf(&rxId, &len, rxBuf);      // Read data: len = data length, buf = data byte(s)
@@ -524,19 +542,32 @@ void loop()
       // check relevant message id
       int qcount=0, starting=0, ending=0;
       //line="";
+     
       while(qcount<qsize) {
           starting  = msgtab[qcount]->start;
           ending = msgtab[qcount]->counts;
           qcount++;
-             
-          for(int i=starting; i<starting+ending;i++) {
          
+          for(int i=starting; i<starting+ending;i++) {
              if(rxId==canmsg[i]->id) {
+
+               // find position in msgtab
+               for(int i=0;i<qsize;i++) {
+                   if(msgtab[i]->id==rxId) mpos=i;
+               }
+
+              if(i==starting) {
+                 // calculating dela time of messages
+                 currentMillis = millis();
+                 interval[mpos]=(int)(currentMillis - previousMillis);
+                 previousMillis = currentMillis;
+              }
+
                // find start position
                startpos=canmsg[i]->start;
                siglen=canmsg[i]->siglen;
+               
                // byte number
-               //Serial.print(startpos);
                for(int j=1;j<9;j++) {
                    bnumber=j;
                    if( ((startpos)/(j*8))==0) break;
@@ -573,7 +604,7 @@ void loop()
                
                  physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
                  kline=kline+String(physval)+",";
-                
+         
                } else {  // concatenated signals over more bytes
                   
                   for(int i=0;i<32;i++) masking[i]='0';
@@ -613,7 +644,7 @@ void loop()
               
                      physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
                      kline=kline+String(physval)+",";
-                   
+               
                } //if(nbbytes<4)
                 
           }// else
@@ -621,16 +652,16 @@ void loop()
         } // if(rxId==canmsg[i]->id)
          
        }// for(int i=starting; i<starting+ending;i++)
-     
+
        if(qcount==qsize) {
-          msgtot++; 
-          if(msgtot==qsize) {
-              Serial.println(kline);
-              logging.println(kline); 
-              logging.flush();
-              msgtot=0;
-              kline="";
-          }
+          kline=String(interval[mpos])+","+kline;
+          
+#ifdef DEBUG_LOGGER
+          Serial.println(kline);
+#endif
+          logging[mpos].println(kline); 
+          logging[mpos].flush();
+          kline="";
        }
       } // while
      

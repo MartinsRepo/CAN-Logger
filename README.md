@@ -1,4 +1,3 @@
-
 # CAN-Logger
 CAN Logging on SD card
 
@@ -13,7 +12,7 @@ The software is reading the file config.txt (which has to be copied on a formatt
 config.txt example:
 
 The VectorDBC file is a text file. So you can copy the messages to be logged into config.txt. Take aware, that: 
-- not more then 40 messages can be logged
+- not more then 40 messages and 10 different messages can be logged
 - consecutive bytes may not more the 4 bytes (long in Arduino has only 4 bytes). 
 
 The example file can be found under config.txt.

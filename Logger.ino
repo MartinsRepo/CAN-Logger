@@ -1,7 +1,22 @@
+/*******************************************************************************************
+ *                                CAN - DATA - LOGGER
+ *                  
+ *  autor:    Martin Hummel, 01/2017
+ *  email:    jupp@linuxmail.org
+ *  licence:  GPL 3.0
+ *  
+ *  function: Logging of CAN traffic in a CSV format on SD card
+ *  
+ *  usage:    define the set of messages / signals to be logged in config.txt on the SD card
+ *            in this case, copy messages / signals of the VECTOR DBC file (text only file)
+ *            start of measurement via bluetooth
+ */
+ 
 #include <SPI.h>
-#include "SdFat.h"
-#include <mcp_can.h>
+#include "SdFat.h"            // SD card
+#include <mcp_can.h>          // MCP CAN
 #include <mcp_can_dfs.h>
+#include <HC05.h>             // HC-05 Bluetooth
 #include <string.h>
 
 #define DEBUG_LOGGER
@@ -35,6 +50,13 @@ File file;
 int lsize=0;
 int qsize=0;
 int msgtot=0;
+
+// bluetooth
+bool meastoggleon=false;
+bool meastoggleoff=false;
+
+char serbuf[3];
+byte sercnt=0;
 
 class MESSAGE {
   public:
@@ -209,12 +231,36 @@ int delimiterpos(char* line, char del, size_t cnt)
    return i;
 }
 
-int freeRam () {
-    extern int __heap_start, *__brkval;
-    int v;
-    return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
-}
+// Check bluetooth activation of the measurement
+// bluetooth command string: on of
+bool startmeas(void) 
+{
+    bool measstate=false;
+    char nextChar;
+    String btcmd; //Befehlsbuffer
 
+    if(Serial1.available()>0) {
+      delay(3);
+      while (Serial1.available()>0){
+         nextChar = Serial1.read();
+         btcmd += nextChar;
+         if(nextChar=='\n') break;
+      }
+    }
+    
+    if(btcmd.substring(btcmd.indexOf('o'),2)=="on") {
+         measstate=true;
+         meastoggleon=false;
+    }
+    if(btcmd.substring(btcmd.indexOf('o'),2)=="of") {
+         measstate=false;
+         meastoggleoff=false;
+    }
+    //if(btcmd!=""){Serial.print(btcmd.substring(btcmd.indexOf('o'),2));Serial.println();}
+    btcmd="";
+    
+  return measstate;
+}
 
 
 void setup() 
@@ -236,6 +282,11 @@ void setup()
   }
 #endif
 
+   // ===
+   // === Bluetooth initialisation
+   // ===
+   Serial1.begin(9600);
+   
    // ===
    // === SD card initialisation
    // ===
@@ -534,137 +585,152 @@ void loop()
   int interval[10]={0,0,0,0,0,0,0,0,0,0};
 
   if (can_active && sd_active) {
-      
-    if(!digitalRead(CAN0_INT)) {                        // If CAN0_INT pin is low, read receive buffer
-    
-      CAN0.readMsgBuf(&rxId, &len, rxBuf);      // Read data: len = data length, buf = data byte(s)
-
-      // check relevant message id
-      int qcount=0, starting=0, ending=0;
-      //line="";
-     
-      while(qcount<qsize) {
-          starting  = msgtab[qcount]->start;
-          ending = msgtab[qcount]->counts;
-          qcount++;
-         
-          for(int i=starting; i<starting+ending;i++) {
-             if(rxId==canmsg[i]->id) {
-
-               // find position in msgtab
-               for(int i=0;i<qsize;i++) {
-                   if(msgtab[i]->id==rxId) mpos=i;
-               }
-
-              if(i==starting) {
-                 // calculating dela time of messages
-                 currentMillis = millis();
-                 interval[mpos]=(int)(currentMillis - previousMillis);
-                 previousMillis = currentMillis;
-              }
-
-               // find start position
-               startpos=canmsg[i]->start;
-               siglen=canmsg[i]->siglen;
-               
-               // byte number
-               for(int j=1;j<9;j++) {
-                   bnumber=j;
-                   if( ((startpos)/(j*8))==0) break;
-               }
-               bnumber--;
-               if(bnumber<0) bnumber=0;
-               bpos=startpos%8;
-    
-               if((bpos+canmsg[i]->siglen)>8){       // check. whether signal + offset more then one byte
-                  sigbyteplus=true;
-               } else {
-                  sigbyteplus=false;
-               }
-    
-               if(!sigbyteplus) {                    // signal matches one byte - filter asignal
-                   
-                  int tmpval=rxBuf[bnumber];
-                  int tmpvalval=0;
-                 
-                  // calculate masking vector
-                  for(int i=0;i<8;i++) masking[i]='0';
-                  for(int i=0;i<8;i++){
-                    if((i>=bpos)&&(i<bpos+siglen)) masking[7-i]='1'; else masking[7-i]='0';
-                  }
-    
-                  // extract value
-                  for(int i=0;i<8;i++) {
-                    if(masking[7-i]=='1') {
-                      if ((tmpval >> i) & 1) {
-                         tmpvalval=tmpvalval|(1<<i);  
-                      }
-                    }
-                 }
-               
-                 physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
-                 kline=kline+String(physval)+",";
-         
-               } else {  // concatenated signals over more bytes
-                  
-                  for(int i=0;i<32;i++) masking[i]='0';
-                  int total=bpos+siglen;
-                  if(total>32) total=32;
-                  
-                  // calculate masking vector
-                  for(int i=0;i<=total;i++){
-                    if((i>bpos)&&(i<=total)) masking[total-i]='1'; else masking[total-i]='0';
-                  }
-                  
-                  // get bytes
-                  int nbbytes=0, j=1, rest=0;
-                 
-                  while(1){
-                      rest=total-j*8;
-                      if(rest>1) nbbytes++; else break;
-                      j++;
-                  }
-                  unsigned long tmplong=0UL;  //==> supports only 4 byte!!!
-                  unsigned long tmpvalval=0UL;
-                  
-                  if(nbbytes<4) {
-                     
-                      for(int i=nbbytes;i>=0;i--) {
-                          tmplong=tmplong +(unsigned long)(rxBuf[bnumber+i]<<(8*i));
-                      }
    
-                      // extract value
-                      for(int i=0;i<total;i++) {
-                        if(masking[i]=='1') {
-                          if ((tmplong >> i) & 1) {
-                             tmpvalval=tmpvalval|(1UL<<i); 
-                          } 
-                        }
-                      }
-              
-                     physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
-                     kline=kline+String(physval)+",";
-               
-               } //if(nbbytes<4)
-                
-          }// else
-        
-        } // if(rxId==canmsg[i]->id)
-         
-       }// for(int i=starting; i<starting+ending;i++)
-
-       if(qcount==qsize) {
-          kline=String(interval[mpos])+","+kline;
-          
+        if(startmeas()) {
 #ifdef DEBUG_LOGGER
-          Serial.println(kline);
+          if(!meastoggleon){
+             Serial.println("Measurement started.");
+             meastoggleon=true;
+           }
 #endif
-          logging[mpos].println(kline); 
-          logging[mpos].flush();
-          kline="";
-       }
-      } // while
-     
-     } //if(!digitalRead(CAN0_INT))
-  } //  if (can_active && sd_active)
+          if(!digitalRead(CAN0_INT)) {                        // If CAN0_INT pin is low, read receive buffer
+          
+            CAN0.readMsgBuf(&rxId, &len, rxBuf);      // Read data: len = data length, buf = data byte(s)
+      
+            // check relevant message id
+            int qcount=0, starting=0, ending=0;
+           
+            while(qcount<qsize) {
+                starting  = msgtab[qcount]->start;
+                ending = msgtab[qcount]->counts;
+                qcount++;
+               
+                for(int i=starting; i<starting+ending;i++) {
+                   if(rxId==canmsg[i]->id) {
+      
+                     // find position in msgtab
+                     for(int i=0;i<qsize;i++) {
+                         if(msgtab[i]->id==rxId) mpos=i;
+                     }
+      
+                    if(i==starting) {
+                       // calculating dela time of messages
+                       currentMillis = millis();
+                       interval[mpos]=(int)(currentMillis - previousMillis);
+                       previousMillis = currentMillis;
+                    }
+      
+                     // find start position
+                     startpos=canmsg[i]->start;
+                     siglen=canmsg[i]->siglen;
+                     
+                     // byte number
+                     for(int j=1;j<9;j++) {
+                         bnumber=j;
+                         if( ((startpos)/(j*8))==0) break;
+                     }
+                     bnumber--;
+                     if(bnumber<0) bnumber=0;
+                     bpos=startpos%8;
+          
+                     if((bpos+canmsg[i]->siglen)>8){       // check. whether signal + offset more then one byte
+                        sigbyteplus=true;
+                     } else {
+                        sigbyteplus=false;
+                     }
+          
+                     if(!sigbyteplus) {                    // signal matches one byte - filter asignal
+                         
+                        int tmpval=rxBuf[bnumber];
+                        int tmpvalval=0;
+                       
+                        // calculate masking vector
+                        for(int i=0;i<8;i++) masking[i]='0';
+                        for(int i=0;i<8;i++){
+                          if((i>=bpos)&&(i<bpos+siglen)) masking[7-i]='1'; else masking[7-i]='0';
+                        }
+          
+                        // extract value
+                        for(int i=0;i<8;i++) {
+                          if(masking[7-i]=='1') {
+                            if ((tmpval >> i) & 1) {
+                               tmpvalval=tmpvalval|(1<<i);  
+                            }
+                          }
+                       }
+                     
+                       physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
+                       kline=kline+String(physval)+",";
+               
+                     } else {  // concatenated signals over more bytes
+                        
+                        for(int i=0;i<32;i++) masking[i]='0';
+                        int total=bpos+siglen;
+                        if(total>32) total=32;
+                        
+                        // calculate masking vector
+                        for(int i=0;i<=total;i++){
+                          if((i>bpos)&&(i<=total)) masking[total-i]='1'; else masking[total-i]='0';
+                        }
+                        
+                        // get bytes
+                        int nbbytes=0, j=1, rest=0;
+                       
+                        while(1){
+                            rest=total-j*8;
+                            if(rest>1) nbbytes++; else break;
+                            j++;
+                        }
+                        unsigned long tmplong=0UL;  //==> supports only 4 byte!!!
+                        unsigned long tmpvalval=0UL;
+                        
+                        if(nbbytes<4) {
+                           
+                            for(int i=nbbytes;i>=0;i--) {
+                                tmplong=tmplong +(unsigned long)(rxBuf[bnumber+i]<<(8*i));
+                            }
+         
+                            // extract value
+                            for(int i=0;i<total;i++) {
+                              if(masking[i]=='1') {
+                                if ((tmplong >> i) & 1) {
+                                   tmpvalval=tmpvalval|(1UL<<i); 
+                                } 
+                              }
+                            }
+                    
+                           physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
+                           kline=kline+String(physval)+",";
+                     
+                     } //if(nbbytes<4)
+                      
+                }// else
+          
+              } // if(rxId==canmsg[i]->id)
+               
+             }// for(int i=starting; i<starting+ending;i++)
+      
+             if(qcount==qsize) {
+                kline=String(interval[mpos])+","+kline;
+                
+#ifdef DEBUG_LOGGER
+               Serial.println(kline);
+#endif
+                logging[mpos].println(kline); 
+                logging[mpos].flush();
+                kline="";
+             }
+            } // while
+           
+           } //if(!digitalRead(CAN0_INT))
+        } else {
+#ifdef DEBUG_LOGGER
+         if(!meastoggleoff) {
+            Serial.println("Measurement stopped.");
+            meastoggleoff=true;
+         } 
+#endif
+        }  // bluetooth activation
+      } //  if (can_active && sd_active)
+
 }// loop

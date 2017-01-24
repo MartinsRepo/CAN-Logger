@@ -1,7 +1,9 @@
+
+
 /*******************************************************************************************
  *                                CAN - DATA - LOGGER
  *                  
- *  autor:    Martin Hummel, 01/2017
+ *  autor:    Martin Hummel, 02/2017
  *  email:    jupp@linuxmail.org
  *  licence:  GPL 3.0
  *  
@@ -13,51 +15,78 @@
  */
  
 #include <SPI.h>
+#include <Wire.h> 
 #include "SdFat.h"            // SD card
 #include <mcp_can.h>          // MCP CAN
 #include <mcp_can_dfs.h>
 #include <HC05.h>             // HC-05 Bluetooth
 #include <string.h>
+#include <RTClib.h>
+
 
 #define DEBUG_LOGGER
 
+int Reset = 6;
+
+// ---
 // SD configuration
-#define SD_CHIPSEL 4
+// ---
+#define SD_CHIPSEL 4              // Set CS to pin 4
 const uint8_t SD_CHIP_SELECT = SD_CHIPSEL;
 const int8_t DISABLE_CHIP_SELECT = -1;
+
 SdFat sd;
+
+// log file
 File logging[10];  
 String kline;
-
-long unsigned int rxId;
-unsigned char len = 0;
-unsigned char rxBuf[8];
-//char msgString[128];                        // Array to store serial string
-
-// CAN configuration
-#define CAN0_INT 2                            // Set INT to pin 2
-#define CAN_CHIPSEL 10
-MCP_CAN CAN0(CAN_CHIPSEL);                    // Set CS to pin 10
+bool header[10]={false,false,false,false,false,false,false,false,false,false};
 unsigned long previousMillis=0;
 
-// control flags
-bool can_active=false;
-bool sd_active=false;
-bool header[10]={false,false,false,false,false,false,false,false,false,false};
-
-// config.txt 
+// ---
+// config.txt
+// --- 
 File file;
 int lsize=0;
 int qsize=0;
 int msgtot=0;
+bool toggle=false;
 
+// ---
+// CAN configuration
+// ---
+#define CAN0_INT 2                // Set INT to pin 2
+#define CAN_CHIPSEL 10            // Set CS to pin 10
+
+// CAN Object init
+MCP_CAN CAN0(CAN_CHIPSEL);
+                    
+long unsigned int rxId;
+unsigned char len = 0;
+unsigned char rxBuf[8];          // CAN receive buffer max 8 byte
+
+// ---
+// control flags and control leds
+// ---
+bool can_active=false;
+bool sd_active=false;
+
+int ledSD    =  8;                // Red LED if SD not initialised
+int ledCAN   =  9;                // Green LED for CAN working
+
+// ---
 // bluetooth
+// ---
 bool meastoggleon=false;
 bool meastoggleoff=false;
 
-char serbuf[3];
-byte sercnt=0;
+// ---
+// RTC Clock
+// ---
+DS1307 rtc;
+ 
 
+//---------------------------------------------------------------------------
 class MESSAGE {
   public:
     MESSAGE(){};
@@ -262,6 +291,163 @@ bool startmeas(void)
   return measstate;
 }
 
+String getDatetime()
+{
+  String datetime;
+  char cbuf[5];
+    
+  // get date / time
+  DateTime now = rtc.now();
+  // day 
+  itoa(now.day(), cbuf, 10);
+  if(now.day()<10) {
+    cbuf[2]=cbuf[1];
+    cbuf[1]=cbuf[0];
+    cbuf[0]='0';
+  }
+  datetime=cbuf;
+  // month
+  itoa(now.month(), cbuf, 10);
+  if(now.month()<10) {
+    cbuf[2]=cbuf[1];
+    cbuf[1]=cbuf[0];
+    cbuf[0]='0';
+  }
+  datetime+=cbuf;
+  // year
+  itoa(now.year(), cbuf, 10);
+  datetime+=cbuf;
+
+  // hour
+  itoa(now.hour(), cbuf, 10);
+  if(now.hour()<10) {
+    cbuf[2]=cbuf[1];
+    cbuf[1]=cbuf[0];
+    cbuf[0]='0';
+  }
+  datetime+=cbuf;
+
+  // minute
+  itoa(now.minute(), cbuf, 10);
+  if(now.minute()<10) {
+    cbuf[2]=cbuf[1];
+    cbuf[1]=cbuf[0];
+    cbuf[0]='0';
+  }
+  datetime+=cbuf;
+  // second
+  itoa(now.second(), cbuf, 10);
+  if(now.second()<10) {
+    cbuf[2]=cbuf[1];
+    cbuf[1]=cbuf[0];
+    cbuf[0]='0';
+  }
+  datetime+=cbuf;
+ 
+  return datetime;
+}
+
+int checkFreeSpace() 
+{
+  uint32_t volFree = sd.vol()->freeClusterCount();
+  return (int)(0.000512*volFree*sd.vol()->blocksPerCluster());
+} 
+
+// ===
+// === SD card initialisation
+// ===
+bool initSD(void)
+{
+  bool sdact=false;
+  
+  if (!sd.begin(SD_CHIPSEL)) {                         // check for inserted SD card
+#ifdef DEBUG_LOGGER
+    Serial.println("SD initialization failed!"); 
+#endif
+     digitalWrite(ledSD, HIGH);                         // sets the Red LED for non init SD card
+     sdact=false;
+   } else {
+#ifdef DEBUG_LOGGER
+    Serial.println("SD initialization done.");
+#endif
+    if (sd.exists("config.txt")) {                      // check for file config.txt on SD card
+#ifdef DEBUG_LOGGER
+      Serial.println("config.txt exists.");
+#endif
+      // Create the file.
+      file = sd.open("config.txt", FILE_READ);          // check for file config.txt can be opened
+      if (!file) {
+#ifdef DEBUG_LOGGER
+        Serial.println("open failed");
+#endif
+        sdact=false;
+      } else {
+        // Rewind the file for read.
+        file.seek(0);
+        sdact=true;
+      }
+ 
+    } // if (sd.exists("config.txt")) 
+   } //  if (!sd.begin(SD_CHIPSEL))
+   return sdact;
+}
+
+// ===
+// === SD card state
+// ===
+void checkSDState(void)
+{
+   // check SD card avaibility and free space
+   cid_t cid; // dummy
+   if (!sd.card()->readCID(&cid)) {
+     if(!toggle) {
+        Serial.println("SD raus");
+        digitalWrite(ledSD, HIGH);        // sets the Red LED for non init SD card
+        toggle=true;
+        sd_active=false;
+        while(!sd.begin(SD_CHIPSEL));     // check for inserted SD card
+     }
+   } else {
+     if(toggle) {
+        //sd_active=initSD();
+        Serial.println("SD rein");
+       // digitalWrite(ledSD, LOW);         // sets the Red LED for non init SD card
+       // toggle=false;
+        digitalWrite(Reset, LOW);
+     }
+   }
+   if(checkFreeSpace()<1)sd_active=false; 
+}
+
+// ===
+// === CAN initialisation
+// ===
+bool initCAN(void)
+{
+  bool canact=false;
+
+   if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
+#ifdef DEBUG_LOGGER
+     Serial.println("MCP2515 Initialized Successfully!");
+#endif
+     digitalWrite(ledCAN, HIGH);                          // sets the Red LED for non init SD card
+
+     CAN0.setMode(MCP_NORMAL);                           // Set operation mode to normal so the MCP2515 sends acks to received data.
+     pinMode(CAN0_INT, INPUT);                           // Configuring pin for /INT input
+#ifdef DEBUG_LOGGER
+     Serial.println("CAN ready...");
+#endif
+     canact=true;
+   } else{
+#ifdef DEBUG_LOGGER
+     Serial.println("Error Initializing MCP2515...");
+#endif
+     canact=false;
+   } // if(CAN0.begin
+
+   return canact;
+}
+
 
 void setup() 
 {
@@ -272,6 +458,18 @@ void setup()
   char *buf;
   
   ArrayList *list = new ArrayList("CAN Signal List");
+
+  // Reset pin
+  digitalWrite(Reset, HIGH);
+  delay(200);
+  pinMode(Reset, OUTPUT);
+  digitalWrite(ledSD, LOW);         // sets the Red LED off for SD card
+
+  // init control LEDs
+  pinMode(ledCAN, OUTPUT);         // CAN active LED
+  digitalWrite(ledCAN, LOW);
+  pinMode(ledSD, OUTPUT);          // SD init LED
+  digitalWrite(ledSD, LOW);
   
 #ifdef DEBUG_LOGGER  
   // Open serial communications and wait for port to open:
@@ -286,60 +484,30 @@ void setup()
    // === Bluetooth initialisation
    // ===
    Serial1.begin(9600);
+
+   // ===
+   // === RTC Clock initialisation
+   // ===
+   Wire.begin(); 
+   rtc.begin();
+   if (!rtc.isrunning()) {
+    #ifdef DEBUG_LOGGER  
+      Serial.println("RTC is NOT running!");
+    #endif
+      // following line sets the RTC to the date & time this sketch was compiled
+      rtc.adjust(DateTime(__DATE__, __TIME__));
+   }  
    
    // ===
    // === SD card initialisation
    // ===
-
-   if (!sd.begin(SD_CHIPSEL)) {                          // check for inserted SD card
-#ifdef DEBUG_LOGGER
-    Serial.println("initialization failed!");
-#endif
-     sd_active=false;
-   } else {
-#ifdef DEBUG_LOGGER
-    Serial.println("initialization done.");
-#endif
-    if (sd.exists("config.txt")) {                      // check for file config.txt on SD card
-#ifdef DEBUG_LOGGER
-      Serial.println("config.txt exists.");
-#endif
-      // Create the file.
-      file = sd.open("config.txt", FILE_READ);          // check for file config.txt can be opened
-      if (!file) {
-#ifdef DEBUG_LOGGER
-        Serial.println("open failed");
-#endif
-        sd_active=false;
-      } else {
-        // Rewind the file for read.
-        file.seek(0);
-        sd_active=true;
-      }
-    } // if (sd.exists("config.txt")) 
-   } //  if (!sd.begin(SD_CHIPSEL))
-
+   sd_active=initSD();
+   
    // ===
    // === CAN initialisation
    // ===
+   can_active=initCAN();
    
-   if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
-#ifdef DEBUG_LOGGER
-     Serial.println("MCP2515 Initialized Successfully!");
-#endif
-     CAN0.setMode(MCP_NORMAL);                           // Set operation mode to normal so the MCP2515 sends acks to received data.
-     pinMode(CAN0_INT, INPUT);                           // Configuring pin for /INT input
-#ifdef DEBUG_LOGGER
-     Serial.println("CAN ready...");
-#endif
-     can_active=true;
-   } else{
-#ifdef DEBUG_LOGGER
-     Serial.println("Error Initializing MCP2515...");
-#endif
-     can_active=false;
-   } // if(CAN0.begin
-  
    // ===
    // === Reading of config.txt
    // ===
@@ -542,21 +710,37 @@ void setup()
    qsize=ipos--;
   
    // open file for log writing
-   String fname;
+   String fname, datetime;
+   String day,mon,yr,hr,cmin,sec;
    int sigpos=0,counts=0;
+
+   // get date and time from RTC
+   datetime=getDatetime();
+   day=datetime.substring(0,2);
+   mon=datetime.substring(2,2);
+   yr=datetime.substring(4,4);
+   hr=datetime.substring(8,2);
+   cmin=datetime.substring(10,2);
+   sec=datetime.substring(12,2);
+   //Serial.println(datetime);
+   
    for(int i=0;i<qsize;i++){
       sigpos=msgtab[i]->start;
       counts=msgtab[i]->counts;
       
       if(header[i]==false) {
           logging[i].seek(0);
-          fname=String(msgtab[i]->id)+".txt";
+          // create unique filename
+          fname=String(msgtab[i]->id)+"_"+datetime+".txt";
           logging[i] = sd.open(fname, FILE_WRITE);
+          logging[i].print("Day: "+day+" Month: "+mon+" Year: "+yr+" "+hr+":"+cmin+":"+sec);  
+          logging[i].println();
           
           // write signal names
           for(int j=sigpos;j<(sigpos+counts);j++) {
               if(j==sigpos) {
                 String ss="Delta Time,"+canmsg[j]->signame+",";
+                
                 logging[i].print(ss);
               } else {
                 logging[i].print(canmsg[j]->signame);
@@ -584,18 +768,21 @@ void loop()
   unsigned long currentMillis;
   int interval[10]={0,0,0,0,0,0,0,0,0,0};
 
+  // check SD card avaibility and free space during loop
+  checkSDState();                                         // RED error state led is switched on in case of SD removed or full
+
   if (can_active && sd_active) {
    
-        if(startmeas()) {
+        //if(startmeas()) {
 #ifdef DEBUG_LOGGER
           if(!meastoggleon){
              Serial.println("Measurement started.");
              meastoggleon=true;
            }
 #endif
-          if(!digitalRead(CAN0_INT)) {                        // If CAN0_INT pin is low, read receive buffer
+          if(!digitalRead(CAN0_INT)) {                    // If CAN0_INT pin is low, read receive buffer
           
-            CAN0.readMsgBuf(&rxId, &len, rxBuf);      // Read data: len = data length, buf = data byte(s)
+            CAN0.readMsgBuf(&rxId, &len, rxBuf);          // Read data: len = data length, buf = data byte(s)
       
             // check relevant message id
             int qcount=0, starting=0, ending=0;
@@ -663,47 +850,50 @@ void loop()
                        kline=kline+String(physval)+",";
                
                      } else {  // concatenated signals over more bytes
-                        
-                        for(int i=0;i<32;i++) masking[i]='0';
-                        int total=bpos+siglen;
-                        if(total>32) total=32;
-                        
-                        // calculate masking vector
-                        for(int i=0;i<=total;i++){
-                          if((i>bpos)&&(i<=total)) masking[total-i]='1'; else masking[total-i]='0';
-                        }
-                        
-                        // get bytes
-                        int nbbytes=0, j=1, rest=0;
-                       
-                        while(1){
-                            rest=total-j*8;
-                            if(rest>1) nbbytes++; else break;
-                            j++;
-                        }
-                        unsigned long tmplong=0UL;  //==> supports only 4 byte!!!
-                        unsigned long tmpvalval=0UL;
-                        
-                        if(nbbytes<4) {
+                        // check, wheather Motorola or Intel format of the signal
+                        if(canmsg[i]->sigformat=="M") {  // Motorola (big endian) format
+                          
+                        } else {
+                            for(int i=0;i<32;i++) masking[i]='0';
+                            int total=bpos+siglen;
+                            if(total>32) total=32;
+                            
+                            // calculate masking vector
+                            for(int i=0;i<=total;i++){
+                              if((i>bpos)&&(i<=total)) masking[total-i]='1'; else masking[total-i]='0';
+                            }
+                            
+                            // get bytes
+                            int nbbytes=0, j=1, rest=0;
                            
-                            for(int i=nbbytes;i>=0;i--) {
-                                tmplong=tmplong +(unsigned long)(rxBuf[bnumber+i]<<(8*i));
+                            while(1){
+                                rest=total-j*8;
+                                if(rest>1) nbbytes++; else break;
+                                j++;
                             }
-         
-                            // extract value
-                            for(int i=0;i<total;i++) {
-                              if(masking[i]=='1') {
-                                if ((tmplong >> i) & 1) {
-                                   tmpvalval=tmpvalval|(1UL<<i); 
-                                } 
-                              }
-                            }
-                    
-                           physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
-                           kline=kline+String(physval)+",";
-                     
-                     } //if(nbbytes<4)
-                      
+                            unsigned long tmplong=0UL;  //==> supports only 4 byte!!!
+                            unsigned long tmpvalval=0UL;
+                            
+                            if(nbbytes<4) {
+                               
+                                for(int i=nbbytes;i>=0;i--) {
+                                    tmplong=tmplong +(unsigned long)(rxBuf[bnumber+i]<<(8*i));
+                                }
+             
+                                // extract value
+                                for(int i=0;i<total;i++) {
+                                  if(masking[i]=='1') {
+                                    if ((tmplong >> i) & 1) {
+                                       tmpvalval=tmpvalval|(1UL<<i); 
+                                    } 
+                                  }
+                                }
+                        
+                               physval=(tmpvalval>>bpos)*canmsg[i]->factor+canmsg[i]->offset;
+                               kline=kline+String(physval)+",";
+                         
+                         } //if(nbbytes<4)
+                     } // Intel / Motorola format
                 }// else
           
               } // if(rxId==canmsg[i]->id)
@@ -716,14 +906,14 @@ void loop()
 #ifdef DEBUG_LOGGER
                Serial.println(kline);
 #endif
-                logging[mpos].println(kline); 
-                logging[mpos].flush();
-                kline="";
+               logging[mpos].println(kline); 
+               logging[mpos].flush();
+               kline="";
              }
             } // while
            
            } //if(!digitalRead(CAN0_INT))
-        } else {
+        /*} else {
 #ifdef DEBUG_LOGGER
          if(!meastoggleoff) {
             Serial.println("Measurement stopped.");
@@ -731,6 +921,12 @@ void loop()
          } 
 #endif
         }  // bluetooth activation
-      } //  if (can_active && sd_active)
+        */
+      }  else {  //  if (can_active && sd_active)
+         if(!sd_active)
+            digitalWrite(ledSD, HIGH);                         // sets the Red LED for non init SD card
+         if(!can_active)
+            digitalWrite(ledCAN, LOW);                         // sets the Green LED off for non active CAN
+      }
 
 }// loop
